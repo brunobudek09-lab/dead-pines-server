@@ -18,7 +18,9 @@ const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 try { fs.mkdirSync(DATA, { recursive: true }); } catch (e) {}
 
-const rooms = new Map();   // código -> { code, host, guest, pid, slot, created }
+const rooms = new Map();   // código -> { code, host, guests[], pid, slot, created }
+const MAX_GUESTS = 3;      // dono + 3 amigos = 4 jogadores
+function others(r, c) { const l = []; if (r.host && r.host !== c) l.push(r.host); for (const g of r.guests) if (g !== c) l.push(g); return l; }
 const ipCount = new Map();
 let nextId = 1;
 
@@ -116,8 +118,9 @@ function onText(c, text) {
   // repasse entre os dois jogadores (o mais comum: vai direto, sem reprocessar)
   if (o.t === 'r') {
     if (!room) return;
-    const other = c.role === 'host' ? room.guest : room.host;
-    if (other && !other.closed) other.sendRaw(text);
+    // marca quem mandou (f) e repassa para todos os outros da sala
+    const out = '{"f":' + c.id + ',' + text.slice(1);
+    for (const x of others(room, c)) if (!x.closed) x.sendRaw(out);
     return;
   }
   if (o.t === 'host') {
@@ -130,7 +133,7 @@ function onText(c, text) {
         clearTimeout(rr.graceT); rr.host = c; c.room = rr; c.role = 'host'; c.pid = o.pid; c.name = String(o.name || 'Dono').slice(0, 24);
         log('dono voltou para a sala', rr.code);
         c.send({ t: 'room', code: rr.code, world: worldInfo(rr.pid, rr.slot), resumed: true });
-        if (rr.guest) { rr.guest.send({ t: 'hostBack' }); c.send({ t: 'peer', name: rr.guest.name }); }
+        for (const g of rr.guests) { g.send({ t: 'hostBack', id: c.id }); c.send({ t: 'peer', id: g.id, name: g.name }); }
         return;
       }
       return c.send({ t: 'err', m: 'O servidor fechou enquanto você estava sem internet. Crie de novo.' });
@@ -141,7 +144,7 @@ function onText(c, text) {
     rooms.forEach(function (r) { if (r.pid === o.pid && r.host && r.host !== c) { r.host.leaving = true; r.host.close(4000); } });
     const code = newCode();
     if (!code) return c.send({ t: 'err', m: 'Tente de novo.' });
-    const r = { code: code, host: c, guest: null, pid: o.pid, slot: o.slot, created: Date.now(), ver: String(o.ver || '').slice(0, 12), pub: o.pub !== false, day: Math.max(0, Math.min(99999, +o.day || 0)) };
+    const r = { code: code, host: c, guests: [], pid: o.pid, slot: o.slot, created: Date.now(), ver: String(o.ver || '').slice(0, 12), pub: o.pub !== false, day: Math.max(0, Math.min(99999, +o.day || 0)) };
     rooms.set(code, r); c.room = r; c.role = 'host'; c.pid = o.pid; c.name = String(o.name || 'Dono').slice(0, 24);
     log('sala aberta', code, 'por', c.name, c.ip);
     return c.send({ t: 'room', code: code, world: worldInfo(o.pid, o.slot) });
@@ -151,12 +154,12 @@ function onText(c, text) {
     const code = String(o.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     const r = rooms.get(code);
     if (!r) return c.send({ t: 'err', m: 'Servidor não encontrado. Confira o código (o dono precisa estar com o jogo aberto).' });
-    if (r.guest) return c.send({ t: 'err', m: 'Esse servidor já tem 2 jogadores.' });
+    if (r.guests.length >= MAX_GUESTS) return c.send({ t: 'err', m: 'Esse servidor está cheio (4 jogadores).' });
     if (!r.host) return c.send({ t: 'err', m: 'O dono desse servidor está reconectando. Tente de novo em instantes.' });
-    r.guest = c; c.room = r; c.role = 'guest'; c.name = String(o.name || 'Amigo').slice(0, 24);
-    log('entrou na sala', code, c.name, c.ip);
-    c.send({ t: 'joined', code: code, host: r.host.name, ver: r.ver });
-    r.host.send({ t: 'peer', name: c.name });
+    r.guests.push(c); c.room = r; c.role = 'guest'; c.name = String(o.name || 'Amigo').slice(0, 24);
+    log('entrou na sala', code, c.name, c.ip, '(' + (1 + r.guests.length) + ' jogadores)');
+    c.send({ t: 'joined', code: code, host: r.host.name, hostId: r.host.id, id: c.id, ver: r.ver, peers: others(r, c).map(function (x) { return { id: x.id, name: x.name }; }) });
+    for (const x of others(r, c)) x.send({ t: 'peer', id: c.id, name: c.name });
     return;
   }
   if (o.t === 'save') {
@@ -175,9 +178,9 @@ function onText(c, text) {
   if (o.t === 'list') {
     // lista de servidores públicos com vaga (para o amigo só tocar e entrar)
     const out = [];
-    rooms.forEach(function (r) { if (r.pub && !r.guest && r.host && !r.host.closed) out.push({ code: r.code, name: r.host.name, ver: r.ver, day: r.day, age: Math.round((Date.now() - r.created) / 1000) }); });
+    rooms.forEach(function (r) { if (r.pub && r.guests.length < MAX_GUESTS && r.host && !r.host.closed) out.push({ code: r.code, name: r.host.name, ver: r.ver, day: r.day, n: 1 + r.guests.length, max: MAX_GUESTS + 1, age: Math.round((Date.now() - r.created) / 1000) }); });
     out.sort(function (a, b) { return a.age - b.age; });
-    let total = 0; rooms.forEach(function (r) { total += 1 + (r.guest ? 1 : 0); });
+    let total = 0; rooms.forEach(function (r) { total += (r.host ? 1 : 0) + r.guests.length; });
     return c.send({ t: 'list', rooms: out.slice(0, 60), online: total });
   }
   if (o.t === 'leave') { c.leaving = true; c.close(1000); return; }
@@ -187,7 +190,8 @@ function onText(c, text) {
 function closeRoom(r) {
   // dono saiu: a sala fecha (o mundo já foi salvo pelo jogo antes de sair)
   clearTimeout(r.graceT); rooms.delete(r.code);
-  if (r.guest) { r.guest.send({ t: 'closed', m: 'O dono do servidor saiu. O servidor foi fechado e o mundo dele foi salvo.' }); r.guest.room = null; r.guest = null; }
+  for (const g of r.guests) { g.send({ t: 'closed', m: 'O dono do servidor saiu. O servidor foi fechado e o mundo dele foi salvo.' }); g.room = null; }
+  r.guests = [];
   log('sala fechada', r.code);
 }
 function onClose(c) {
@@ -199,12 +203,12 @@ function onClose(c) {
     if (c.leaving) { closeRoom(r); return; }
     // caiu a internet do dono: segura a sala por 45 s esperando ele voltar
     r.host = null;
-    if (r.guest) r.guest.send({ t: 'hostLost' });
+    for (const g of r.guests) g.send({ t: 'hostLost' });
     log('dono caiu, esperando', r.code);
     r.graceT = setTimeout(function () { if (!r.host) closeRoom(r); }, 45000);
-  } else if (c.role === 'guest' && r.guest === c) {
-    r.guest = null;
-    if (r.host) r.host.send({ t: 'peerLeft' });
+  } else if (c.role === 'guest' && r.guests.indexOf(c) >= 0) {
+    r.guests.splice(r.guests.indexOf(c), 1);
+    for (const x of others(r, c)) x.send({ t: 'peerLeft', id: c.id });
     log('saiu da sala', r.code, c.name);
   }
 }
@@ -212,7 +216,7 @@ function onClose(c) {
 // ---------- HTTP + upgrade ----------
 const server = http.createServer(function (req, res) {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
-  let players = 0; rooms.forEach(function (r) { players += 1 + (r.guest ? 1 : 0); });
+  let players = 0; rooms.forEach(function (r) { players += (r.host ? 1 : 0) + r.guests.length; });
   res.end('DEAD PINES — servidor online\nSalas abertas: ' + rooms.size + '\nJogadores: ' + players + '\n');
 });
 
