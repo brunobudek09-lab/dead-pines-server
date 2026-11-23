@@ -117,15 +117,28 @@ function onText(c, text) {
   if (o.t === 'r') {
     if (!room) return;
     const other = c.role === 'host' ? room.guest : room.host;
-    if (other) other.sendRaw(text);
+    if (other && !other.closed) other.sendRaw(text);
     return;
   }
   if (o.t === 'host') {
     if (room) return c.send({ t: 'err', m: 'Você já está numa sala.' });
     if (!okPid(o.pid) || !okSlot(o.slot)) return c.send({ t: 'err', m: 'Dados inválidos.' });
+    // dono voltando depois de cair a internet: retoma a mesma sala (mesmo código)
+    if (o.resume) {
+      const rr = rooms.get(String(o.resume));
+      if (rr && rr.pid === o.pid && !rr.host) {
+        clearTimeout(rr.graceT); rr.host = c; c.room = rr; c.role = 'host'; c.pid = o.pid; c.name = String(o.name || 'Dono').slice(0, 24);
+        log('dono voltou para a sala', rr.code);
+        c.send({ t: 'room', code: rr.code, world: worldInfo(rr.pid, rr.slot), resumed: true });
+        if (rr.guest) { rr.guest.send({ t: 'hostBack' }); c.send({ t: 'peer', name: rr.guest.name }); }
+        return;
+      }
+      return c.send({ t: 'err', m: 'O servidor fechou enquanto você estava sem internet. Crie de novo.' });
+    }
+    rooms.forEach(function (r) { if (r.pid === o.pid && !r.host) closeRoom(r); });
     if (rooms.size >= MAX_ROOMS) return c.send({ t: 'err', m: 'Servidor lotado. Tente mais tarde.' });
     // se esse jogador já tinha uma sala aberta (caiu a internet), fecha a antiga
-    rooms.forEach(function (r) { if (r.pid === o.pid && r.host && r.host !== c) r.host.close(4000); });
+    rooms.forEach(function (r) { if (r.pid === o.pid && r.host && r.host !== c) { r.host.leaving = true; r.host.close(4000); } });
     const code = newCode();
     if (!code) return c.send({ t: 'err', m: 'Tente de novo.' });
     const r = { code: code, host: c, guest: null, pid: o.pid, slot: o.slot, created: Date.now(), ver: String(o.ver || '').slice(0, 12), pub: o.pub !== false, day: Math.max(0, Math.min(99999, +o.day || 0)) };
@@ -139,6 +152,7 @@ function onText(c, text) {
     const r = rooms.get(code);
     if (!r) return c.send({ t: 'err', m: 'Servidor não encontrado. Confira o código (o dono precisa estar com o jogo aberto).' });
     if (r.guest) return c.send({ t: 'err', m: 'Esse servidor já tem 2 jogadores.' });
+    if (!r.host) return c.send({ t: 'err', m: 'O dono desse servidor está reconectando. Tente de novo em instantes.' });
     r.guest = c; c.room = r; c.role = 'guest'; c.name = String(o.name || 'Amigo').slice(0, 24);
     log('entrou na sala', code, c.name, c.ip);
     c.send({ t: 'joined', code: code, host: r.host.name, ver: r.ver });
@@ -166,19 +180,28 @@ function onText(c, text) {
     let total = 0; rooms.forEach(function (r) { total += 1 + (r.guest ? 1 : 0); });
     return c.send({ t: 'list', rooms: out.slice(0, 60), online: total });
   }
-  if (o.t === 'leave') { c.close(1000); return; }
+  if (o.t === 'leave') { c.leaving = true; c.close(1000); return; }
   if (o.t === 'ping') return c.send({ t: 'pong' });
 }
 
+function closeRoom(r) {
+  // dono saiu: a sala fecha (o mundo já foi salvo pelo jogo antes de sair)
+  clearTimeout(r.graceT); rooms.delete(r.code);
+  if (r.guest) { r.guest.send({ t: 'closed', m: 'O dono do servidor saiu. O servidor foi fechado e o mundo dele foi salvo.' }); r.guest.room = null; r.guest = null; }
+  log('sala fechada', r.code);
+}
 function onClose(c) {
   const n = (ipCount.get(c.ip) || 1) - 1; if (n <= 0) ipCount.delete(c.ip); else ipCount.set(c.ip, n);
   const r = c.room; c.room = null;
   if (!r) return;
   if (c.role === 'host') {
-    // dono saiu: a sala fecha (o mundo já foi salvo pelo jogo antes de sair)
-    rooms.delete(r.code);
-    if (r.guest) { r.guest.send({ t: 'closed', m: 'O dono do servidor saiu. O servidor foi fechado e o mundo dele foi salvo.' }); r.guest.room = null; }
-    log('sala fechada', r.code);
+    if (r.host !== c) return;
+    if (c.leaving) { closeRoom(r); return; }
+    // caiu a internet do dono: segura a sala por 45 s esperando ele voltar
+    r.host = null;
+    if (r.guest) r.guest.send({ t: 'hostLost' });
+    log('dono caiu, esperando', r.code);
+    r.graceT = setTimeout(function () { if (!r.host) closeRoom(r); }, 45000);
   } else if (c.role === 'guest' && r.guest === c) {
     r.guest = null;
     if (r.host) r.host.send({ t: 'peerLeft' });
